@@ -263,16 +263,6 @@ Die produktive Webapp existiert bereits, ist aber proprietär und nicht Teil die
 - Für produktive Veranstaltungen ist ein kompletter End-to-End-Test mit Webapp, Decoder, Transpondern und Live-Anzeige erforderlich.
 - Dieses Repository enthält keine öffentliche Serverinstallation der Radsportmanager Webapp.
 
-## Sicherheit
-
-`config.ini` darf nicht veröffentlicht werden. Sie enthält Decoderdaten, Webapp-URLs und den API-Key.
-
-Falls ein API-Key versehentlich in ein Repository gelangt ist:
-
-1. Key in der Webapp sperren oder löschen.
-2. neuen Key erzeugen.
-3. lokale `config.ini` aktualisieren.
-4. Git-Historie bereinigen, falls der Key bereits gepusht wurde.
 
 ## Rechte und Nutzung
 
