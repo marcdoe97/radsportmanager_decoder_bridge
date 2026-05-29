@@ -1,0 +1,17 @@
+[Unit]
+Description=MYLAPS ProChip Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rsmbridge
+WorkingDirectory=/opt/radsportmanager-decoder-bridge
+ExecStart=/opt/radsportmanager-decoder-bridge/venv/bin/python3 mylaps_bridge.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

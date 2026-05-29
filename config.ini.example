@@ -1,0 +1,50 @@
+[decoder]
+# IP-Adresse des ProChip Smart Decoders im lokalen Netzwerk
+host = 192.168.1.100
+# Protokoll: amb_p3 für Smart Decoder mit 0x8E/0x8F Frames, dci für alte DCI-Frames
+protocol = amb_p3
+# AMB P3 Port aus Mitschnitt: 5403 (DCI war früher oft 3601)
+port = 5403
+# Optionale AMB-P3-Startsequenz aus dem Mitschnitt; leer lassen, wenn der Decoder sofort streamt
+startup_hex = 020405b40103030801010402
+# Reconnect-Intervall in Sekunden bei Verbindungsabbruch
+reconnect_interval = 5
+
+[server]
+# yes = Passings zusätzlich an radsportmanager.com senden; no = rein lokaler Decoder-Betrieb.
+enabled = yes
+# URL des passing-Endpunkts auf dem Cloud-Server
+api_url = https://radsportmanager.com/api/mylaps/passing.php
+# URL des Batch-Endpunkts. Leer lassen, wenn automatisch aus api_url abgeleitet werden soll.
+batch_api_url = https://radsportmanager.com/api/mylaps/passing_batch.php
+# URL für Transponder-Registry (Long ID -> Short ID)
+registry_url = https://radsportmanager.com/api/mylaps/transponder_registry.php
+# API-Key (muss mit api_keys-Tabelle auf dem Server übereinstimmen)
+api_key = HIER_DEINEN_KEY_EINTRAGEN
+# Timeout für HTTP-Requests in Sekunden
+timeout = 5
+
+[bridge]
+# Simulationsmodus: yes = kein echter Decoder nötig (zum Testen)
+simulate = no
+# Simulation: 45 km/h bei 10-facher Geschwindigkeit.
+# Beispiel: 1,00 km Runde => real ca. 80s, simuliert ca. 8s.
+simulation_average_speed_kmh = 45
+simulation_speed_factor = 10
+simulation_lap_length_km = 1.0
+# Wie oft die Transponder-Registry neu geladen wird (Sekunden)
+registry_refresh_interval = 60
+# Lokale SQLite-Datenbank für Offline-Puffer
+buffer_db = buffer.db
+# Decoder-Lesen und HTTP-Senden sind entkoppelt. Diese Werte reichen für dichte Zielpassagen.
+queue_max_size = 5000
+batch_size = 100
+batch_flush_interval = 0.5
+http_workers = 3
+# Log-Level: DEBUG, INFO, WARNING, ERROR
+log_level = INFO
+
+[local]
+# Lokales Kampfgericht-Dashboard: Bridge schreibt jedes Passing parallel in diese SQLite-Datenbank.
+enabled = yes
+db = local_timing.db
