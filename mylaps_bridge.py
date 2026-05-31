@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 MYLAPS ProChip Bridge
 Verbindet sich mit dem ProChip Smart Decoder via AMB P3 oder DCI-Protokoll (TCP)
@@ -21,6 +21,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -64,6 +65,7 @@ SIM_SPEED_FACTOR = config.getfloat("bridge", "simulation_speed_factor", fallback
 SIM_LAP_LENGTH_KM = config.getfloat("bridge", "simulation_lap_length_km", fallback=1.0)
 LOCAL_TIMING_ENABLED = config.getboolean("local", "enabled", fallback=True)
 LOCAL_TIMING_DB = config.get("local", "db", fallback="local_timing.db")
+LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
 
 if not os.path.isabs(BUFFER_DB):
     BUFFER_DB = os.path.join(os.path.dirname(__file__), BUFFER_DB)
@@ -444,6 +446,12 @@ def micros_to_datetime(micros: int) -> datetime:
     return datetime.fromtimestamp(micros / 1_000_000.0, tz=timezone.utc)
 
 
+def rtc_micros_to_datetime(micros: int) -> datetime:
+    utc_like = datetime.fromtimestamp(micros / 1_000_000.0, tz=timezone.utc)
+    local_wall_time = utc_like.replace(tzinfo=LOCAL_TIMEZONE)
+    return local_wall_time.astimezone(timezone.utc)
+
+
 def parse_amb_p3_record(frame: bytes):
     frame = unescape_amb_p3(frame)
     if len(frame) < 11 or frame[0] != AMB_SOR or frame[-1] != AMB_EOR:
@@ -490,13 +498,19 @@ def parse_amb_p3_record(frame: bytes):
         log.debug("AMB P3 Passing ohne gültige Zeit verworfen: %s", long_id)
         return
 
-    passing_dt = micros_to_datetime(_u64le(time_field))
+    if AMB_F_UTC_TIME in fields:
+        passing_dt = micros_to_datetime(_u64le(time_field))
+        time_source = "utc"
+    else:
+        passing_dt = rtc_micros_to_datetime(_u64le(time_field))
+        time_source = "rtc_local"
     metadata = {
         "chip_numeric_id": transponder_number,
         "passing_number": _u32le(fields[AMB_F_PASSING_NUMBER]) if len(fields.get(AMB_F_PASSING_NUMBER, b"")) == 4 else None,
         "strength": _u16le(fields[AMB_F_STRENGTH]) if len(fields.get(AMB_F_STRENGTH, b"")) == 2 else None,
         "hits": _u16le(fields[AMB_F_HITS]) if len(fields.get(AMB_F_HITS, b"")) == 2 else None,
         "decoder_id": _u32le(fields[AMB_F_DECODER_ID]) if len(fields.get(AMB_F_DECODER_ID, b"")) == 4 else None,
+        "time_source": time_source,
         "protocol": "amb_p3",
     }
 
