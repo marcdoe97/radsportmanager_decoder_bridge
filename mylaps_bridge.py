@@ -9,8 +9,8 @@ import configparser
 import hashlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
-import queue
 import random
 import signal
 import socket
@@ -59,7 +59,10 @@ LOG_LEVEL = config.get("bridge", "log_level", fallback="INFO")
 QUEUE_MAX_SIZE = config.getint("bridge", "queue_max_size", fallback=5000)
 BATCH_SIZE = config.getint("bridge", "batch_size", fallback=100)
 BATCH_FLUSH_INTERVAL = config.getfloat("bridge", "batch_flush_interval", fallback=0.5)
-HTTP_WORKERS = config.getint("bridge", "http_workers", fallback=3)
+HTTP_WORKERS = config.getint("bridge", "http_workers", fallback=1)
+LOG_FILE = config.get("bridge", "log_file", fallback="bridge.log")
+LOG_MAX_BYTES = config.getint("bridge", "log_max_bytes", fallback=5_000_000)
+LOG_BACKUP_COUNT = config.getint("bridge", "log_backup_count", fallback=5)
 SIM_AVERAGE_SPEED_KMH = config.getfloat("bridge", "simulation_average_speed_kmh", fallback=45.0)
 SIM_SPEED_FACTOR = config.getfloat("bridge", "simulation_speed_factor", fallback=10.0)
 SIM_LAP_LENGTH_KM = config.getfloat("bridge", "simulation_lap_length_km", fallback=1.0)
@@ -71,6 +74,8 @@ if not os.path.isabs(BUFFER_DB):
     BUFFER_DB = os.path.join(os.path.dirname(__file__), BUFFER_DB)
 if not os.path.isabs(LOCAL_TIMING_DB):
     LOCAL_TIMING_DB = os.path.join(os.path.dirname(__file__), LOCAL_TIMING_DB)
+if LOG_FILE and not os.path.isabs(LOG_FILE):
+    LOG_FILE = os.path.join(os.path.dirname(__file__), LOG_FILE)
 
 if not BATCH_API_URL and API_URL:
     parts = urlsplit(API_URL)
@@ -82,12 +87,20 @@ if not BATCH_API_URL and API_URL:
 # Logging
 # ---------------------------------------------------------------------------
 
+log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+if LOG_FILE:
+    log_handlers.append(
+        RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=max(100_000, LOG_MAX_BYTES),
+            backupCount=max(1, LOG_BACKUP_COUNT),
+            encoding="utf-8",
+        )
+    )
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=log_handlers,
 )
 log = logging.getLogger("mylaps_bridge")
 
@@ -100,57 +113,216 @@ def init_buffer(db_path: str) -> sqlite3.Connection:
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS buffer (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             payload TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            attempts INTEGER DEFAULT 0
+            attempts INTEGER NOT NULL DEFAULT 0,
+            event_id TEXT,
+            chip_long_id TEXT,
+            short_id TEXT,
+            state TEXT NOT NULL DEFAULT 'PENDING',
+            next_attempt_at REAL NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at TEXT,
+            decoder_id TEXT,
+            passing_number INTEGER
         )"""
+    )
+    existing_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(buffer)").fetchall()
+    }
+    additions = {
+        "event_id": "TEXT",
+        "chip_long_id": "TEXT",
+        "short_id": "TEXT",
+        "state": "TEXT NOT NULL DEFAULT 'PENDING'",
+        "next_attempt_at": "REAL NOT NULL DEFAULT 0",
+        "last_error": "TEXT",
+        "updated_at": "TEXT",
+        "decoder_id": "TEXT",
+        "passing_number": "INTEGER",
+    }
+    for column, definition in additions.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE buffer ADD COLUMN {column} {definition}")
+
+    # Alte Pufferdaten werden ohne Verlust in das neue Zustandsmodell uebernommen.
+    for row in conn.execute(
+        "SELECT id, payload FROM buffer WHERE event_id IS NULL OR event_id=''"
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        event_id = str(payload.get("event_id") or f"legacy-buffer-{row['id']}")
+        conn.execute(
+            """UPDATE buffer
+               SET event_id=?, chip_long_id=?, short_id=?, decoder_id=?, passing_number=?,
+                   state=COALESCE(NULLIF(state,''),'PENDING'), updated_at=COALESCE(updated_at,created_at)
+               WHERE id=?""",
+            (
+                event_id,
+                str(payload.get("chip_long_id") or ""),
+                str(payload.get("short_id") or ""),
+                str(payload.get("decoder_id") or ""),
+                payload.get("passing_number"),
+                int(row["id"]),
+            ),
+        )
+    conn.execute(
+        "DELETE FROM buffer WHERE id NOT IN (SELECT MIN(id) FROM buffer GROUP BY event_id)"
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uniq_buffer_event ON buffer(event_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_buffer_due ON buffer(state,next_attempt_at,id)"
     )
     conn.commit()
     return conn
 
 
-def buffer_put(conn: sqlite3.Connection, payload: dict):
+def buffer_put(conn: sqlite3.Connection, payload: dict, state: str = "PENDING"):
+    now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT INTO buffer (payload, created_at) VALUES (?, ?)",
-        (json.dumps(payload), datetime.now(timezone.utc).isoformat()),
+        """INSERT INTO buffer (
+               payload, created_at, attempts, event_id, chip_long_id, short_id,
+               state, next_attempt_at, last_error, updated_at, decoder_id, passing_number
+           ) VALUES (?, ?, 0, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
+           ON CONFLICT(event_id) DO UPDATE SET
+               payload=excluded.payload,
+               chip_long_id=excluded.chip_long_id,
+               short_id=CASE WHEN excluded.short_id<>'' THEN excluded.short_id ELSE buffer.short_id END,
+               state=CASE WHEN buffer.state='FAILED' THEN buffer.state ELSE excluded.state END,
+               next_attempt_at=CASE WHEN buffer.state='FAILED' THEN buffer.next_attempt_at ELSE 0 END,
+               updated_at=excluded.updated_at,
+               decoder_id=COALESCE(NULLIF(excluded.decoder_id,''),buffer.decoder_id),
+               passing_number=COALESCE(excluded.passing_number,buffer.passing_number)""",
+        (
+            json.dumps(payload, ensure_ascii=False),
+            now,
+            str(payload.get("event_id") or ""),
+            str(payload.get("chip_long_id") or ""),
+            str(payload.get("short_id") or ""),
+            state,
+            now,
+            str(payload.get("decoder_id") or ""),
+            payload.get("passing_number"),
+        ),
     )
     conn.commit()
 
 
-def buffer_flush(conn: sqlite3.Connection):
-    """Versucht gepufferte Passings erneut zu senden."""
+def _retry_delay(attempts: int) -> float:
+    return min(300.0, max(2.0, float(2 ** min(max(attempts, 1), 8))))
+
+
+def _mark_local_delivery(event_id: str, delivery_status: str, error: str = "", short_id: str = ""):
+    if not (LOCAL_TIMING_ENABLED and local_timing):
+        return
+    try:
+        local_timing.update_passing_delivery(
+            LOCAL_TIMING_DB,
+            event_id,
+            delivery_status,
+            error=error,
+            short_id=short_id,
+        )
+    except Exception as exc:
+        log.warning("Lokaler Passing-Status konnte nicht aktualisiert werden: %s", exc)
+
+
+def buffer_flush(conn: sqlite3.Connection) -> int:
+    """Sendet faellige Passings geordnet und wertet jeden Serverstatus einzeln aus."""
+    now_epoch = time.time()
     with buffer_lock:
         rows = conn.execute(
-            "SELECT id, payload FROM buffer WHERE attempts < 10 ORDER BY id LIMIT ?",
-            (BATCH_SIZE,),
+            """SELECT id, payload, attempts
+               FROM buffer
+               WHERE state IN ('PENDING','UNMAPPED','RETRY') AND next_attempt_at<=?
+               ORDER BY id
+               LIMIT ?""",
+            (now_epoch, BATCH_SIZE),
         ).fetchall()
     if not rows:
-        return
+        return 0
 
-    row_ids = []
-    payloads = []
-    for row_id, payload_str in rows:
+    send_rows: list[tuple[int, int, dict]] = []
+    for row in rows:
+        row_id = int(row["id"])
         try:
-            payloads.append(json.loads(payload_str))
-            row_ids.append(row_id)
-        except ValueError:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
             with buffer_lock:
-                conn.execute("DELETE FROM buffer WHERE id = ?", (row_id,))
+                conn.execute(
+                    "UPDATE buffer SET state='FAILED',last_error='Ungueltiges lokales JSON',updated_at=? WHERE id=?",
+                    (datetime.now(timezone.utc).isoformat(), row_id),
+                )
                 conn.commit()
+            continue
 
-    ok = send_batch_to_server(payloads)
+        short_id = str(payload.get("short_id") or "").strip()
+        if not short_id:
+            short_id = resolve_long_id(str(payload.get("chip_long_id") or "")) or ""
+            if short_id:
+                payload["short_id"] = short_id
+                with buffer_lock:
+                    conn.execute(
+                        "UPDATE buffer SET payload=?,short_id=?,state='PENDING',next_attempt_at=0,last_error=NULL,updated_at=? WHERE id=?",
+                        (json.dumps(payload, ensure_ascii=False), short_id, datetime.now(timezone.utc).isoformat(), row_id),
+                    )
+                    conn.commit()
+                _mark_local_delivery(str(payload.get("event_id") or ""), "PENDING", short_id=short_id)
+            else:
+                message = "Long-ID noch nicht in der Registry"
+                with buffer_lock:
+                    conn.execute(
+                        "UPDATE buffer SET state='UNMAPPED',next_attempt_at=?,last_error=?,updated_at=? WHERE id=?",
+                        (
+                            now_epoch + max(5, REGISTRY_REFRESH),
+                            message,
+                            datetime.now(timezone.utc).isoformat(),
+                            row_id,
+                        ),
+                    )
+                    conn.commit()
+                _mark_local_delivery(str(payload.get("event_id") or ""), "UNMAPPED", message)
+                continue
+
+        send_rows.append((row_id, int(row["attempts"] or 0), payload))
+
+    if not send_rows:
+        return len(rows)
+
+    outcomes = send_batch_to_server([payload for _, _, payload in send_rows])
+    updated_at = datetime.now(timezone.utc).isoformat()
     with buffer_lock:
-        if ok:
-            conn.executemany("DELETE FROM buffer WHERE id = ?", [(row_id,) for row_id in row_ids])
-        else:
-            conn.executemany(
-                "UPDATE buffer SET attempts = attempts + 1 WHERE id = ?",
-                [(row_id,) for row_id in row_ids],
-            )
+        for row_id, attempts, payload in send_rows:
+            event_id = str(payload.get("event_id") or "")
+            outcome = outcomes.get(event_id, {"disposition": "RETRY", "reason": "Keine Einzelbestaetigung vom Server"})
+            disposition = str(outcome.get("disposition") or "RETRY").upper()
+            reason = str(outcome.get("reason") or "")[:1000]
+            if disposition in {"ACK", "DUPLICATE"}:
+                conn.execute("DELETE FROM buffer WHERE id=?", (row_id,))
+                _mark_local_delivery(event_id, "ACKED", reason, str(payload.get("short_id") or ""))
+            elif disposition == "REJECTED":
+                conn.execute(
+                    "UPDATE buffer SET state='FAILED',attempts=attempts+1,last_error=?,updated_at=? WHERE id=?",
+                    (reason or "Server hat Passing dauerhaft abgelehnt", updated_at, row_id),
+                )
+                _mark_local_delivery(event_id, "FAILED", reason, str(payload.get("short_id") or ""))
+            else:
+                new_attempts = attempts + 1
+                conn.execute(
+                    "UPDATE buffer SET state='RETRY',attempts=?,next_attempt_at=?,last_error=?,updated_at=? WHERE id=?",
+                    (new_attempts, now_epoch + _retry_delay(new_attempts), reason, updated_at, row_id),
+                )
+                _mark_local_delivery(event_id, "RETRY", reason, str(payload.get("short_id") or ""))
         conn.commit()
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +331,13 @@ def buffer_flush(conn: sqlite3.Connection):
 
 registry: dict[str, str] = {}
 registry_lock = threading.Lock()
+registry_last_success: str | None = None
+registry_last_error: str | None = None
 
 
 def load_registry():
-    global registry
+    global registry, registry_last_success, registry_last_error
+    loaded_remote = False
     if SERVER_ENABLED and REGISTRY_URL:
         try:
             resp = requests.get(
@@ -172,10 +347,23 @@ def load_registry():
             )
             resp.raise_for_status()
             data = resp.json()
+            remote_registry = {}
+            for entry in data:
+                long_id = str(entry.get("long_id") or "").strip()
+                short_id = str(entry.get("short_id") or "").strip()
+                if not long_id or not short_id:
+                    continue
+                remote_registry[long_id] = short_id
+                remote_registry[long_id.upper()] = short_id
+                remote_registry[long_id.lower()] = short_id
             with registry_lock:
-                registry = {entry["long_id"]: entry["short_id"] for entry in data}
+                registry = remote_registry
+            loaded_remote = True
+            registry_last_success = datetime.now(timezone.utc).isoformat()
+            registry_last_error = None
             log.info("Transponder-Registry geladen: %d Einträge", len(registry))
         except Exception as e:
+            registry_last_error = str(e)
             log.warning("Registry konnte nicht geladen werden: %s", e)
 
     if LOCAL_TIMING_ENABLED and local_timing:
@@ -188,11 +376,25 @@ def load_registry():
         except Exception as e:
             log.warning("Lokale Registry konnte nicht geladen werden: %s", e)
 
+    if LOCAL_TIMING_ENABLED and local_timing:
+        try:
+            local_timing.update_bridge_status(
+                LOCAL_TIMING_DB,
+                registry_last_success=registry_last_success,
+                registry_last_error=registry_last_error,
+                registry_entries=len(registry),
+            )
+        except Exception as e:
+            log.debug("Registry-Status konnte lokal nicht gespeichert werden: %s", e)
+    if loaded_remote or registry:
+        sender_wakeup.set()
+
 
 def registry_worker():
     while not shutdown_event.is_set():
+        if shutdown_event.wait(REGISTRY_REFRESH):
+            break
         load_registry()
-        shutdown_event.wait(REGISTRY_REFRESH)
 
 
 def resolve_long_id(long_id: str) -> str | None:
@@ -215,56 +417,75 @@ def resolve_long_id(long_id: str) -> str | None:
 
 buffer_conn: sqlite3.Connection | None = None
 buffer_lock = threading.Lock()
-payload_queue: queue.Queue[dict] = queue.Queue(maxsize=QUEUE_MAX_SIZE)
+sender_wakeup = threading.Event()
 
 
-def send_to_server(payload: dict, use_buffer: bool = True) -> bool:
-    if not SERVER_ENABLED:
-        return True
-    try:
-        resp = requests.post(
-            API_URL,
-            json=payload,
-            headers={"X-API-Key": API_KEY},
-            timeout=HTTP_TIMEOUT,
+def _retry_outcomes(payloads: list[dict], reason: str) -> dict[str, dict]:
+    return {
+        str(payload.get("event_id") or ""): {"disposition": "RETRY", "reason": reason}
+        for payload in payloads
+    }
+
+
+def parse_server_outcomes(payloads: list[dict], data: dict) -> dict[str, dict]:
+    """Normalisiert neue und alte API-Antworten ohne Passings still zu verlieren."""
+    outcomes: dict[str, dict] = {}
+    results = data.get("results")
+    if isinstance(results, list):
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            event_id = str(result.get("event_id") or "")
+            if not event_id:
+                continue
+            disposition = str(result.get("disposition") or "").upper()
+            if disposition not in {"ACK", "DUPLICATE", "RETRY", "REJECTED"}:
+                disposition = "RETRY"
+            outcomes[event_id] = {
+                "disposition": disposition,
+                "reason": str(result.get("reason") or result.get("message") or ""),
+            }
+
+    # Rueckwaertskompatibilitaet: Eine alte API bestaetigt nur den ganzen Batch.
+    if not outcomes:
+        successful = bool(data.get("success"))
+        retryable = (
+            int(data.get("unresolved") or 0) > 0
+            or int(data.get("errors") or 0) > 0
+            or int(data.get("ignored") or 0) > 0
         )
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-            except ValueError:
-                data = {}
+        disposition = "ACK" if successful and not retryable else "RETRY"
+        reason = "" if disposition == "ACK" else "Alte API ohne eindeutige Einzelbestaetigung"
+        return {
+            str(payload.get("event_id") or ""): {"disposition": disposition, "reason": reason}
+            for payload in payloads
+        }
 
-            if data.get("status") == "UNRESOLVED":
-                log.warning(
-                    "Passing gesendet, aber Server konnte Chip nicht zuordnen: short_id=%s",
-                    payload.get("short_id"),
-                )
-            elif data.get("duplicate"):
-                log.info("Passing war bereits bekannt: %s", payload.get("event_id", ""))
-            else:
-                log.info(
-                    "Passing akzeptiert: short_id=%s processed=%s",
-                    payload.get("short_id"),
-                    data.get("processed", []),
-                )
-            return True
-        else:
-            log.warning("Server antwortete %s: %s", resp.status_code, resp.text[:200])
-            return False
-    except Exception as e:
-        log.warning("Netzwerkfehler beim Senden: %s", e)
-        if use_buffer and buffer_conn:
-            with buffer_lock:
-                buffer_put(buffer_conn, payload)
-            log.info("Passing gepuffert (offline): %s", payload.get("event_id", ""))
-        return False
+    for payload in payloads:
+        event_id = str(payload.get("event_id") or "")
+        outcomes.setdefault(
+            event_id,
+            {"disposition": "RETRY", "reason": "Serverantwort enthaelt keinen Status fuer dieses Passing"},
+        )
+    return outcomes
 
 
-def send_batch_to_server(payloads: list[dict]) -> bool:
+def send_to_server(payload: dict, use_buffer: bool = True) -> dict:
+    """Kompatibilitaets-Wrapper; die produktive Zustellung verwendet den Batch-Endpunkt."""
+    return send_batch_to_server([payload]).get(
+        str(payload.get("event_id") or ""),
+        {"disposition": "RETRY", "reason": "Keine Serverbestaetigung"},
+    )
+
+
+def send_batch_to_server(payloads: list[dict]) -> dict[str, dict]:
     if not payloads:
-        return True
+        return {}
     if not SERVER_ENABLED:
-        return True
+        return {
+            str(payload.get("event_id") or ""): {"disposition": "ACK", "reason": "Server deaktiviert"}
+            for payload in payloads
+        }
     try:
         resp = requests.post(
             BATCH_API_URL,
@@ -274,7 +495,7 @@ def send_batch_to_server(payloads: list[dict]) -> bool:
         )
         if resp.status_code != 200:
             log.warning("Batch-Endpoint antwortete %s: %s", resp.status_code, resp.text[:200])
-            return False
+            return _retry_outcomes(payloads, f"HTTP {resp.status_code}")
 
         try:
             data = resp.json()
@@ -283,7 +504,7 @@ def send_batch_to_server(payloads: list[dict]) -> bool:
 
         if not data.get("success", False):
             log.warning("Batch wurde vom Server abgelehnt: %s", data)
-            return False
+            return _retry_outcomes(payloads, str(data.get("message") or "Batch abgelehnt"))
 
         log.info(
             "Batch gesendet: received=%s accepted=%s ignored=%s unresolved=%s duplicate=%s",
@@ -293,50 +514,51 @@ def send_batch_to_server(payloads: list[dict]) -> bool:
             data.get("unresolved", 0),
             data.get("duplicate", 0),
         )
-        return True
+        return parse_server_outcomes(payloads, data)
     except Exception as e:
         log.warning("Netzwerkfehler beim Batch-Senden: %s", e)
+        return _retry_outcomes(payloads, str(e))
+
+
+def enqueue_payload(payload: dict, wake_sender: bool = True) -> bool:
+    if not buffer_conn:
+        log.error("Dauerhafter Puffer nicht bereit: %s", payload.get("event_id", ""))
         return False
+    state = "PENDING" if str(payload.get("short_id") or "").strip() else "UNMAPPED"
+    with buffer_lock:
+        buffer_put(buffer_conn, payload, state=state)
+    if wake_sender:
+        sender_wakeup.set()
+    return True
 
 
-def enqueue_payload(payload: dict):
+def recover_local_pending() -> int:
+    """Rebuild the send buffer after a crash between local storage and enqueue."""
+    if not (SERVER_ENABLED and LOCAL_TIMING_ENABLED and local_timing and buffer_conn):
+        return 0
     try:
-        payload_queue.put_nowait(payload)
-    except queue.Full:
-        if buffer_conn:
-            with buffer_lock:
-                buffer_put(buffer_conn, payload)
-            log.warning("HTTP-Queue voll, Passing lokal gepuffert: %s", payload.get("event_id", ""))
-        else:
-            log.error("HTTP-Queue voll und Puffer nicht bereit: %s", payload.get("event_id", ""))
+        payloads = local_timing.pending_delivery_payloads(LOCAL_TIMING_DB)
+    except Exception as exc:
+        log.warning("Lokale offene Zustellungen konnten nicht geladen werden: %s", exc)
+        return 0
+    with buffer_lock:
+        for payload in payloads:
+            state = "PENDING" if str(payload.get("short_id") or "").strip() else "UNMAPPED"
+            buffer_put(buffer_conn, payload, state=state)
+    if payloads:
+        log.info("%d lokal offene Passings in den Sendepuffer uebernommen", len(payloads))
+        sender_wakeup.set()
+    return len(payloads)
 
 
 def http_sender_worker(worker_id: int):
-    while not shutdown_event.is_set() or not payload_queue.empty():
-        batch = []
-        try:
-            first_payload = payload_queue.get(timeout=0.2)
-        except queue.Empty:
+    log.info("Geordneter HTTP-Sender %s gestartet", worker_id)
+    while not shutdown_event.is_set():
+        processed = buffer_flush(buffer_conn) if buffer_conn else 0
+        if processed >= BATCH_SIZE:
             continue
-
-        batch.append(first_payload)
-        deadline = time.monotonic() + BATCH_FLUSH_INTERVAL
-        while len(batch) < BATCH_SIZE and time.monotonic() < deadline:
-            timeout = max(0.0, deadline - time.monotonic())
-            try:
-                batch.append(payload_queue.get(timeout=timeout))
-            except queue.Empty:
-                break
-
-        ok = send_batch_to_server(batch)
-        if not ok and buffer_conn:
-            with buffer_lock:
-                for payload in batch:
-                    buffer_put(buffer_conn, payload)
-            log.warning("HTTP-Worker %s hat %d Passings lokal gepuffert", worker_id, len(batch))
-
-        for _ in batch:
-            payload_queue.task_done()
+        sender_wakeup.wait(max(0.1, BATCH_FLUSH_INTERVAL))
+        sender_wakeup.clear()
 
 
 def build_payload(
@@ -345,36 +567,62 @@ def build_payload(
     passing_time_iso: str,
     metadata: dict | None = None,
 ) -> dict:
-    event_id = hashlib.sha256(
-        f"{long_id}:{passing_time_iso}".encode()
-    ).hexdigest()[:32]
+    metadata = metadata or {}
+    decoder_id = metadata.get("decoder_id")
+    passing_number = metadata.get("passing_number")
+    if decoder_id is not None and passing_number is not None:
+        # Passing numbers may restart after a decoder reboot, therefore the
+        # decoder timestamp is part of the durable idempotency key as well.
+        identity = f"decoder:{decoder_id}:passing:{passing_number}:time:{passing_time_iso}"
+    else:
+        identity = f"chip:{long_id}:time:{passing_time_iso}"
+    event_id = hashlib.sha256(identity.encode()).hexdigest()[:32]
     payload = {
         "event_id": event_id,
         "chip_long_id": long_id,
         "short_id": short_id,
         "passing_time": passing_time_iso,
     }
-    if metadata:
-        payload.update({k: v for k, v in metadata.items() if v is not None})
+    payload.update({k: v for k, v in metadata.items() if v is not None})
     return payload
 
 
 def handle_passing(long_id: str, passing_dt: datetime, metadata: dict | None = None):
-    short_id = resolve_long_id(long_id)
-    if short_id is None:
-        log.warning("Unbekannte Long ID: %s - nicht in Registry", long_id)
-        return
-
     passing_time_iso = passing_dt.astimezone(timezone.utc).isoformat()
-    log.info("LongID %s -> ShortID %s", long_id, short_id)
+    short_id = resolve_long_id(long_id) or ""
     payload = build_payload(long_id, short_id, passing_time_iso, metadata)
+    queued = False
+    if SERVER_ENABLED:
+        # The send buffer is the first durable write. A process crash can then
+        # never leave a decoder passing only in memory.
+        queued = enqueue_payload(payload, wake_sender=False)
     if LOCAL_TIMING_ENABLED and local_timing:
         try:
-            local_timing.record_passing(LOCAL_TIMING_DB, payload)
+            sequence_gap = local_timing.record_passing(LOCAL_TIMING_DB, payload)
+            if sequence_gap:
+                log.error(
+                    "Decoder-Sequenzluecke: Decoder %s sprang von Passing %s auf %s (%s fehlen)",
+                    sequence_gap["decoder_id"],
+                    sequence_gap["previous_passing_number"],
+                    sequence_gap["current_passing_number"],
+                    sequence_gap["missing_count"],
+                )
         except Exception as e:
             log.warning("Lokales Speichern des Passings fehlgeschlagen: %s", e)
-    if SERVER_ENABLED:
-        enqueue_payload(payload)
+
+    if short_id:
+        log.info("LongID %s -> ShortID %s", long_id, short_id)
+    else:
+        log.warning(
+            "Unbekannte Long ID dauerhaft vorgemerkt: %s (event_id=%s)",
+            long_id,
+            payload["event_id"],
+        )
+
+    if queued:
+        sender_wakeup.set()
+    elif not SERVER_ENABLED:
+        _mark_local_delivery(payload["event_id"], "LOCAL_ONLY", short_id=short_id)
 
 
 # ---------------------------------------------------------------------------
@@ -802,17 +1050,6 @@ def simulation_worker():
 
 
 # ---------------------------------------------------------------------------
-# Buffer-Flush Worker
-# ---------------------------------------------------------------------------
-
-def flush_worker():
-    while not shutdown_event.is_set():
-        if buffer_conn:
-            buffer_flush(buffer_conn)
-        shutdown_event.wait(30)
-
-
-# ---------------------------------------------------------------------------
 # Graceful Shutdown
 # ---------------------------------------------------------------------------
 
@@ -822,6 +1059,7 @@ shutdown_event = threading.Event()
 def on_signal(sig, frame):
     log.info("Signal %s empfangen - beende Bridge ...", sig)
     shutdown_event.set()
+    sender_wakeup.set()
 
 
 signal.signal(signal.SIGINT, on_signal)
@@ -856,32 +1094,31 @@ def main():
 
     buffer_conn = init_buffer(BUFFER_DB)
     log.info("Offline-Puffer: %s", BUFFER_DB)
+    recover_local_pending()
 
     threads = []
 
-    # Registry laden
+    # Vor dem Decoderstart einmal synchron laden. Selbst bei einem Fehler werden
+    # neue Passings dauerhaft als UNMAPPED gespeichert und spaeter nachgezogen.
+    load_registry()
     reg_thread = threading.Thread(target=registry_worker, daemon=True, name="registry")
     reg_thread.start()
     threads.append(reg_thread)
 
-    # Kurz warten bis Registry geladen
-    time.sleep(2)
-
     if SERVER_ENABLED:
-        # Puffer-Flush
-        flush_thread = threading.Thread(target=flush_worker, daemon=True, name="flush")
-        flush_thread.start()
-        threads.append(flush_thread)
-
-        for worker_id in range(max(1, HTTP_WORKERS)):
-            http_thread = threading.Thread(
-                target=http_sender_worker,
-                args=(worker_id + 1,),
-                daemon=True,
-                name=f"http-{worker_id + 1}",
+        if HTTP_WORKERS != 1:
+            log.warning(
+                "http_workers=%s wird aus Gruenden der Passing-Reihenfolge auf 1 begrenzt",
+                HTTP_WORKERS,
             )
-            http_thread.start()
-            threads.append(http_thread)
+        http_thread = threading.Thread(
+            target=http_sender_worker,
+            args=(1,),
+            daemon=True,
+            name="http-ordered",
+        )
+        http_thread.start()
+        threads.append(http_thread)
 
     # Decoder oder Simulation
     if SIMULATE:
@@ -894,6 +1131,13 @@ def main():
     log.info("Bridge läuft. Ctrl+C zum Beenden.")
     shutdown_event.wait()
 
+    sender_wakeup.set()
+    for thread in threads:
+        thread.join(timeout=max(3, HTTP_TIMEOUT + 2))
+    if buffer_conn:
+        with buffer_lock:
+            buffer_conn.commit()
+            buffer_conn.close()
     log.info("Bridge beendet.")
 
 

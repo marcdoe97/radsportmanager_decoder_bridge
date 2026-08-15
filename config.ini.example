@@ -40,9 +40,12 @@ buffer_db = buffer.db
 queue_max_size = 5000
 batch_size = 100
 batch_flush_interval = 0.5
-http_workers = 3
+http_workers = 1
 # Log-Level: DEBUG, INFO, WARNING, ERROR
 log_level = INFO
+log_file = bridge.log
+log_max_bytes = 5000000
+log_backup_count = 5
 
 [local]
 # Lokales Kampfgericht-Dashboard: Bridge schreibt jedes Passing parallel in diese SQLite-Datenbank.

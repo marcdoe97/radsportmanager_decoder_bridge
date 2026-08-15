@@ -25,8 +25,18 @@ MAPPING_ALIASES = {
 }
 
 
+class ClosingConnection(sqlite3.Connection):
+    """SQLite context manager that also releases the file handle on exit."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn = sqlite3.connect(db_path, check_same_thread=False, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -65,14 +75,69 @@ def init_db(db_path: str | Path) -> None:
                 passing_time TEXT NOT NULL,
                 metadata TEXT DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'ACTIVE',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                decoder_id TEXT,
+                passing_number INTEGER,
+                delivery_status TEXT NOT NULL DEFAULT 'PENDING',
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS bridge_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                registry_last_success TEXT,
+                registry_last_error TEXT,
+                registry_entries INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS decoder_sequence (
+                decoder_id TEXT PRIMARY KEY,
+                last_passing_number INTEGER NOT NULL,
+                last_passing_time TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS decoder_gaps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decoder_id TEXT NOT NULL,
+                previous_passing_number INTEGER NOT NULL,
+                current_passing_number INTEGER NOT NULL,
+                missing_count INTEGER NOT NULL,
+                previous_passing_time TEXT,
+                current_passing_time TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                UNIQUE(decoder_id, previous_passing_number, current_passing_number)
             );
 
             CREATE INDEX IF NOT EXISTS idx_passings_short_time
                 ON passings (short_id, passing_time);
             CREATE INDEX IF NOT EXISTS idx_passings_time
                 ON passings (passing_time);
+            CREATE INDEX IF NOT EXISTS idx_decoder_gaps_detected
+                ON decoder_gaps (detected_at);
             """
+        )
+        existing_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(passings)").fetchall()
+        }
+        additions = {
+            "updated_at": "TEXT",
+            "decoder_id": "TEXT",
+            "passing_number": "INTEGER",
+            # Rows from versions without delivery tracking must not be sent
+            # again blindly; their historic server state is unknown.
+            "delivery_status": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            "delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "last_error": "TEXT",
+        }
+        for column, definition in additions.items():
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE passings ADD COLUMN {column} {definition}")
+        conn.execute("UPDATE passings SET updated_at=COALESCE(updated_at,created_at)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_passings_delivery ON passings (delivery_status, passing_time)"
         )
 
 
@@ -224,7 +289,65 @@ def resolve_short_id(db_path: str | Path, long_id: str) -> str | None:
     return row["short_id"] if row else None
 
 
-def record_passing(db_path: str | Path, payload: dict) -> None:
+def _record_decoder_sequence(conn: sqlite3.Connection, payload: dict, timestamp: str) -> dict | None:
+    decoder_id = str(payload.get("decoder_id") or "").strip()
+    raw_number = payload.get("passing_number")
+    if not decoder_id or raw_number is None:
+        return None
+    try:
+        current = int(raw_number)
+    except (TypeError, ValueError):
+        return None
+    passing_time = str(payload.get("passing_time") or timestamp)
+    previous = conn.execute(
+        "SELECT last_passing_number,last_passing_time FROM decoder_sequence WHERE decoder_id=?",
+        (decoder_id,),
+    ).fetchone()
+    gap = None
+    if previous and current > int(previous["last_passing_number"]) + 1:
+        previous_number = int(previous["last_passing_number"])
+        missing_count = current - previous_number - 1
+        conn.execute(
+            """INSERT OR IGNORE INTO decoder_gaps (
+                   decoder_id,previous_passing_number,current_passing_number,missing_count,
+                   previous_passing_time,current_passing_time,detected_at
+               ) VALUES (?,?,?,?,?,?,?)""",
+            (
+                decoder_id,
+                previous_number,
+                current,
+                missing_count,
+                str(previous["last_passing_time"] or ""),
+                passing_time,
+                timestamp,
+            ),
+        )
+        gap = {
+            "decoder_id": decoder_id,
+            "previous_passing_number": previous_number,
+            "current_passing_number": current,
+            "missing_count": missing_count,
+        }
+
+    should_advance = previous is None or current > int(previous["last_passing_number"])
+    # A lower sequence with a later decoder timestamp indicates a decoder
+    # restart. It becomes the new baseline instead of producing endless gaps.
+    if previous and current < int(previous["last_passing_number"]):
+        should_advance = passing_time > str(previous["last_passing_time"] or "")
+    if should_advance:
+        conn.execute(
+            """INSERT INTO decoder_sequence (decoder_id,last_passing_number,last_passing_time,updated_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(decoder_id) DO UPDATE SET
+                   last_passing_number=excluded.last_passing_number,
+                   last_passing_time=excluded.last_passing_time,
+                   updated_at=excluded.updated_at""",
+            (decoder_id, current, passing_time, timestamp),
+        )
+    return gap
+
+
+def record_passing(db_path: str | Path, payload: dict) -> dict | None:
     init_db(db_path)
     timestamp = now_iso()
     metadata = {
@@ -232,20 +355,130 @@ def record_passing(db_path: str | Path, payload: dict) -> None:
         for key, value in payload.items()
         if key not in {"event_id", "chip_long_id", "short_id", "passing_time"}
     }
+    gap = None
     with connect(db_path) as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO passings (
-                event_id, chip_long_id, short_id, passing_time, metadata, created_at
+            INSERT INTO passings (
+                event_id, chip_long_id, short_id, passing_time, metadata, status,
+                created_at, updated_at, decoder_id, passing_number, delivery_status
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                short_id=CASE WHEN excluded.short_id<>'' THEN excluded.short_id ELSE passings.short_id END,
+                metadata=excluded.metadata,
+                status=CASE
+                    WHEN passings.status='IGNORED' THEN 'IGNORED'
+                    WHEN excluded.short_id<>'' THEN 'ACTIVE'
+                    ELSE passings.status
+                END,
+                updated_at=excluded.updated_at,
+                decoder_id=COALESCE(NULLIF(excluded.decoder_id,''),passings.decoder_id),
+                passing_number=COALESCE(excluded.passing_number,passings.passing_number)
             """,
             (
                 payload["event_id"],
                 payload["chip_long_id"],
-                payload["short_id"],
+                str(payload.get("short_id") or ""),
                 payload["passing_time"],
                 json.dumps(metadata, ensure_ascii=False),
+                "ACTIVE" if str(payload.get("short_id") or "").strip() else "UNMAPPED",
                 timestamp,
+                timestamp,
+                str(payload.get("decoder_id") or ""),
+                payload.get("passing_number"),
+                "PENDING",
             ),
         )
+        gap = _record_decoder_sequence(conn, payload, timestamp)
+    return gap
+
+
+def update_passing_delivery(
+    db_path: str | Path,
+    event_id: str,
+    delivery_status: str,
+    error: str = "",
+    short_id: str = "",
+) -> None:
+    init_db(db_path)
+    timestamp = now_iso()
+    with connect(db_path) as conn:
+        conn.execute(
+            """UPDATE passings
+               SET delivery_status=?,
+                   delivery_attempts=delivery_attempts+CASE WHEN ? IN ('RETRY','FAILED') THEN 1 ELSE 0 END,
+                   last_error=NULLIF(?,''),
+                   short_id=CASE WHEN ?<>'' THEN ? ELSE short_id END,
+                   status=CASE
+                       WHEN status='IGNORED' THEN status
+                       WHEN ?<>'' THEN 'ACTIVE'
+                       WHEN ?='UNMAPPED' THEN 'UNMAPPED'
+                       ELSE status
+                   END,
+                   updated_at=?
+               WHERE event_id=?""",
+            (
+                delivery_status,
+                delivery_status,
+                error,
+                short_id,
+                short_id,
+                short_id,
+                delivery_status,
+                timestamp,
+                event_id,
+            ),
+        )
+
+
+def update_bridge_status(
+    db_path: str | Path,
+    registry_last_success: str | None,
+    registry_last_error: str | None,
+    registry_entries: int,
+) -> None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO bridge_status (
+                   id, registry_last_success, registry_last_error, registry_entries, updated_at
+               ) VALUES (1, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   registry_last_success=excluded.registry_last_success,
+                   registry_last_error=excluded.registry_last_error,
+                   registry_entries=excluded.registry_entries,
+                   updated_at=excluded.updated_at""",
+            (registry_last_success, registry_last_error, int(registry_entries), now_iso()),
+        )
+
+
+def pending_delivery_payloads(db_path: str | Path, limit: int = 10000) -> list[dict]:
+    """Return locally recorded passings that still need durable delivery."""
+    init_db(db_path)
+    safe_limit = max(1, min(int(limit), 100_000))
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT event_id, chip_long_id, short_id, passing_time, metadata
+               FROM passings
+               WHERE delivery_status IN ('PENDING','RETRY','UNMAPPED')
+               ORDER BY passing_time,event_id
+               LIMIT ?""",
+            (safe_limit,),
+        ).fetchall()
+    payloads: list[dict] = []
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        payload = {
+            "event_id": str(row["event_id"]),
+            "chip_long_id": str(row["chip_long_id"] or ""),
+            "short_id": str(row["short_id"] or ""),
+            "passing_time": str(row["passing_time"]),
+        }
+        if isinstance(metadata, dict):
+            payload.update(metadata)
+        payloads.append(payload)
+    return payloads

@@ -16,6 +16,7 @@ import local_timing
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "local_timing.db"
+BUFFER_DB_PATH = BASE_DIR / "buffer.db"
 
 
 def ensure_streamlit_runtime() -> None:
@@ -201,6 +202,117 @@ def render_control(passings: pd.DataFrame) -> None:
                 st.rerun()
 
 
+def render_bridge_diagnostics() -> None:
+    st.subheader("Bridge- und Zustellstatus")
+    delivery = load_frame(
+        """
+        SELECT delivery_status, COUNT(*) AS anzahl
+        FROM passings
+        GROUP BY delivery_status
+        ORDER BY delivery_status
+        """
+    )
+    if delivery.empty:
+        st.info("Noch keine Passings erfasst.")
+    else:
+        columns = st.columns(max(1, min(5, len(delivery))))
+        for index, row in delivery.iterrows():
+            columns[index % len(columns)].metric(str(row["delivery_status"]), int(row["anzahl"]))
+
+    status = load_frame(
+        "SELECT registry_last_success, registry_last_error, registry_entries, updated_at FROM bridge_status WHERE id=1"
+    )
+    if not status.empty:
+        row = status.iloc[0]
+        st.write(
+            f"Registry: **{int(row['registry_entries'])} EintrÃ¤ge**, "
+            f"zuletzt erfolgreich: `{row['registry_last_success'] or '-'}`"
+        )
+        if row["registry_last_error"]:
+            st.error(f"Letzter Registry-Fehler: {row['registry_last_error']}")
+
+    pending = load_frame(
+        """
+        SELECT passing_time, chip_long_id, short_id, delivery_status,
+               delivery_attempts, last_error, passing_number
+        FROM passings
+        WHERE delivery_status NOT IN ('ACKED','LOCAL_ONLY')
+        ORDER BY passing_time DESC
+        LIMIT 300
+        """
+    )
+    if pending.empty:
+        st.success("Keine offenen oder fehlgeschlagenen Zustellungen.")
+    else:
+        st.dataframe(
+            pending.rename(
+                columns={
+                    "passing_time": "Zeit",
+                    "chip_long_id": "Long ID",
+                    "short_id": "Short ID",
+                    "delivery_status": "Zustellung",
+                    "delivery_attempts": "Versuche",
+                    "last_error": "Fehler",
+                    "passing_number": "Passing Nr.",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            height=420,
+        )
+
+    if BUFFER_DB_PATH.exists():
+        try:
+            with local_timing.connect(BUFFER_DB_PATH) as conn:
+                buffer_counts = pd.read_sql_query(
+                    "SELECT state, COUNT(*) AS anzahl FROM buffer GROUP BY state ORDER BY state",
+                    conn,
+                )
+            if not buffer_counts.empty:
+                st.caption("Dauerhafter Sendepuffer")
+                st.dataframe(buffer_counts, width="stretch", hide_index=True)
+                retry_col, failed_col = st.columns(2)
+                with retry_col:
+                    if st.button("Offene jetzt erneut versuchen"):
+                        with local_timing.connect(BUFFER_DB_PATH) as conn:
+                            conn.execute(
+                                "UPDATE buffer SET next_attempt_at=0 WHERE state IN ('PENDING','RETRY','UNMAPPED')"
+                            )
+                        st.success("Offene Zustellungen wurden fuer den naechsten Bridge-Lauf freigegeben.")
+                with failed_col:
+                    if st.button("Abgelehnte erneut freigeben"):
+                        with local_timing.connect(BUFFER_DB_PATH) as conn:
+                            conn.execute(
+                                "UPDATE buffer SET state='RETRY',next_attempt_at=0,last_error=NULL WHERE state='FAILED'"
+                            )
+                        st.warning("Dauerhaft abgelehnte Eintraege werden erneut geprueft.")
+        except Exception as exc:
+            st.warning(f"Sendepuffer konnte nicht gelesen werden: {exc}")
+
+    gaps = load_frame(
+        """SELECT detected_at,decoder_id,previous_passing_number,current_passing_number,
+                  missing_count,previous_passing_time,current_passing_time
+           FROM decoder_gaps ORDER BY detected_at DESC,id DESC LIMIT 100"""
+    )
+    if not gaps.empty:
+        st.error(f"Erkannte Decoder-Sequenzluecken: {len(gaps)} (letzte 100)")
+        st.dataframe(
+            gaps.rename(
+                columns={
+                    "detected_at": "Erkannt",
+                    "decoder_id": "Decoder",
+                    "previous_passing_number": "Vorherige Nr.",
+                    "current_passing_number": "Aktuelle Nr.",
+                    "missing_count": "Fehlende Nummern",
+                    "previous_passing_time": "Vorherige Zeit",
+                    "current_passing_time": "Aktuelle Zeit",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title="Radsportmanager Decoder Dashboard", layout="wide")
     local_timing.init_db(DB_PATH)
@@ -228,7 +340,7 @@ def main() -> None:
     metric_b.metric("Durchfahrten", active_passings)
     metric_c.metric("Letztes Signal", last_seen or "-")
 
-    tabs = st.tabs(["Dashboard", "Rundenprotokoll", "Import"])
+    tabs = st.tabs(["Dashboard", "Rundenprotokoll", "Bridge-Status", "Import"])
     with tabs[0]:
         st.subheader("Live-Stand")
         visible = standings.rename(
@@ -255,6 +367,9 @@ def main() -> None:
         render_control(passings)
 
     with tabs[2]:
+        render_bridge_diagnostics()
+
+    with tabs[3]:
         render_imports()
 
 

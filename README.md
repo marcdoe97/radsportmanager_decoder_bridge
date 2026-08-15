@@ -17,10 +17,11 @@ Bereits enthalten:
 - DCI-Fallback für ältere Decoder
 - Weiterleitung von Passings per HTTPS an die Radsportmanager Webapp
 - Batch-Upload für dichte Zielpassagen
-- Offline-Puffer in SQLite (`buffer.db`)
-- automatische Nachlieferung gepufferter Passings
+- verlustfreier SQLite-Eingangspuffer (`buffer.db`) vor jeder HTTP-Zustellung
+- automatische Nachlieferung ohne feste Versuchsgrenze und mit Einzelbestätigung je Passing
 - Reconnect bei Decoder-Verbindungsabbruch
 - Transponder-Registry-Cache: Long ID zu Short ID
+- dauerhafte Warnung bei Lücken in der Decoder-`passing_number`
 - lokales Streamlit-Dashboard für Kampfgericht und Rundenprotokoll
 - lokaler SQLite-Speicher (`local_timing.db`)
 - Simulationsmodus ohne echten Decoder
@@ -131,7 +132,7 @@ python mylaps_bridge.py
 
 ## Lokales Dashboard
 
-Das lokale Dashboard läuft direkt auf dem Decoder-PC und kann auch ohne Online-Verbindung genutzt werden. Es zeigt Fahrer, Durchfahrten und Rundenstand aus `local_timing.db`.
+Das lokale Dashboard läuft direkt auf dem Decoder-PC und kann auch ohne Online-Verbindung genutzt werden. Es zeigt Fahrer, Durchfahrten und Rundenstand aus `local_timing.db`. Im Tab `Bridge-Status` sind offene, nicht zugeordnete und fehlgeschlagene Zustellungen, der Registry-Status, erkannte Decoder-Sequenzlücken und der dauerhafte Sendepuffer sichtbar. Dort können offene oder bewusst abgelehnte Einträge erneut freigegeben werden.
 
 Start:
 
@@ -211,11 +212,14 @@ Wichtige Werte in `config.ini`:
 | `bridge.simulation_lap_length_km` | simulierte Rundenlänge | `1.0` |
 | `bridge.registry_refresh_interval` | Reload-Intervall für Registry | `60` |
 | `bridge.buffer_db` | lokale Offline-Pufferdatenbank | `buffer.db` |
-| `bridge.queue_max_size` | maximale interne Queue-Größe | `5000` |
+| `bridge.queue_max_size` | Kompatibilitätswert alter Konfigurationen; die produktive Queue liegt dauerhaft in SQLite | `5000` |
 | `bridge.batch_size` | maximale Batch-Größe | `100` |
 | `bridge.batch_flush_interval` | Flush-Intervall für Batches | `0.5` |
-| `bridge.http_workers` | parallele HTTP-Worker | `3` |
+| `bridge.http_workers` | geordnete HTTP-Zustellung; wird aus Reihenfolgegründen auf `1` begrenzt | `1` |
 | `bridge.log_level` | Log-Level | `INFO` |
+| `bridge.log_file` | rotierende Protokolldatei | `bridge.log` |
+| `bridge.log_max_bytes` | maximale Größe je Logdatei | `5000000` |
+| `bridge.log_backup_count` | Anzahl alter Logdateien | `5` |
 | `local.enabled` | lokales Dashboard befüllen | `yes` |
 | `local.db` | lokale Dashboard-Datenbank | `local_timing.db` |
 
@@ -254,6 +258,8 @@ Die produktive Webapp existiert bereits, ist aber proprietär und nicht Teil die
 8. Offline-Puffer testen, indem die Internetverbindung kurz getrennt wird.
 9. Live-Anzeige und Ergebnislogik in der Webapp prüfen.
 10. API-Key geheim halten und nicht in Git einchecken.
+
+Die Bridge löscht ein Passing erst aus `buffer.db`, wenn der Server genau dessen `event_id` als verarbeitet oder bereits vorhanden bestätigt. Nicht zugeordnete Transponder bleiben erhalten und werden nach einem Registry-Update erneut versucht. Mehrere HTTP-Worker werden absichtlich nicht verwendet, damit dichte Zielpassagen in Decoder-Reihenfolge beim Server eintreffen.
 
 ## Bekannte offene Punkte
 
