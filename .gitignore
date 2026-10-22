@@ -2,8 +2,10 @@ config.ini
 *.db
 *.sqlite
 *.sqlite3
+
 buffer.db-shm
 buffer.db-wal
+
 __pycache__/
 *.py[cod]
 
